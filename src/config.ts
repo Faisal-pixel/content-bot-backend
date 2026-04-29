@@ -33,11 +33,16 @@ export const config = {
   n8nSharedSecret: requireEnv('N8N_SHARED_SECRET'),
   dashboardUser: requireEnv('DASHBOARD_USER'),
   dashboardPassword: requireEnv('DASHBOARD_PASSWORD'),
+  sessionSecret: requireEnv('SESSION_SECRET'),
 
   n8nFlow2WebhookUrl: requireEnv('N8N_FLOW_2_WEBHOOK_URL'),
 
-  hootsuiteApiToken: requireEnv('HOOTSUITE_API_TOKEN'),
-  hootsuiteApiBase: process.env['HOOTSUITE_API_BASE'] ?? 'https://platform.hootsuite.com/v1',
-
   dbPath: process.env['DB_PATH'] ?? './data/content-bot.db',
+
+  // CORS — comma-separated list of allowed origins.
+  // In dev, default to the Vite dev server. In prod, set this to your dashboard URL.
+  corsOrigins: (process.env['CORS_ORIGINS'] ?? 'http://localhost:5173')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
 } as const;

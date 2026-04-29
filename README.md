@@ -2,7 +2,7 @@
 
 ## What this is
 
-A small Node.js + TypeScript + Express API that sits between n8n, the DevSpot Content Bot dashboard, and Hootsuite. Its job is to hold state (the week's topic suggestions, published topics for dedup, tracked Hootsuite posts), forward webhook triggers to n8n when Sabeen clicks "Generate", and detect when posts get approved in Hootsuite via a 15-minute polling job. It does not call Claude directly (n8n does that) and it does not serve any UI (the React frontend does that).
+A small Node.js + TypeScript + Express API that sits between n8n, the DevSpot Content Bot dashboard, and a SQLite database. Its job is to hold state (the week's topic suggestions, published topics for dedup, content drafts), forward webhook triggers to n8n when Sabeen clicks "Generate", receive the finished drafts back from n8n, and push live updates to the dashboard via Server-Sent Events. It does not call Claude directly (n8n does that) and it does not serve any UI (the React frontend does that).
 
 ---
 
@@ -13,32 +13,35 @@ A small Node.js + TypeScript + Express API that sits between n8n, the DevSpot Co
 │               │ ────────────────────────────────▶ │                     │
 │     n8n       │     GET  /api/published-topics    │  content-bot-       │
 │  (automation) │ ◀──────────────────────────────── │  backend            │
-│               │     POST /api/drafts-ready        │  (this service)     │
+│               │     POST /api/drafts              │  (this service)     │
 │               │ ────────────────────────────────▶ │                     │
 └───────────────┘                                   │  SQLite DB          │
                                                     │  (./data/)          │
-┌───────────────┐     GET  /api/topics              │                     │
+┌───────────────┐     POST /api/login               │                     │
 │               │ ────────────────────────────────▶ │                     │
-│  React        │     GET  /api/status              │                     │
+│  React        │     GET  /api/topics              │                     │
 │  Dashboard    │ ────────────────────────────────▶ │                     │
-│  (frontend)   │     GET  /api/calendar            │                     │
+│  (frontend)   │     GET  /api/status              │                     │
+│               │ ────────────────────────────────▶ │                     │
+│               │     GET  /api/calendar            │                     │
 │               │ ────────────────────────────────▶ │                     │
 │               │     POST /api/generate            │                     │
 │               │ ────────────────────────────────▶ │                     │
-└───────────────┘                                   └──────────┬──────────┘
-                                                               │
-                                          GET /v1/messages     │  every 15 min
-                                          (approval polling)   │
-                                                               ▼
-                                                    ┌─────────────────────┐
-                                                    │      Hootsuite      │
-                                                    │  (social scheduler) │
-                                                    └─────────────────────┘
+│               │     GET  /api/drafts              │                     │
+│               │ ────────────────────────────────▶ │                     │
+│               │     PATCH /api/drafts/:id         │                     │
+│               │ ────────────────────────────────▶ │                     │
+│               │                                   │                     │
+│               │ ◀──────────────────────────────── │                     │
+│               │  GET /api/events/topics  (SSE)    │                     │
+│               │ ◀──────────────────────────────── │                     │
+│               │  GET /api/events/drafts  (SSE)    │                     │
+└───────────────┘                                   └─────────────────────┘
 ```
 
 **Auth model:**
-- n8n-facing routes (`/api/weekly-topics`, `/api/drafts-ready`, `/api/published-topics`) → `X-API-Secret` header
-- Dashboard-facing routes (`/api/topics`, `/api/status`, `/api/calendar`, `/api/generate`) → HTTP Basic Auth
+- n8n-facing routes (`/api/weekly-topics`, `/api/drafts`, `/api/published-topics`) → `X-API-Secret` header
+- Dashboard-facing routes (`/api/topics`, `/api/status`, `/api/calendar`, `/api/generate`, `/api/drafts/*`, `/api/events/*`) → session cookie (set by `POST /api/login`)
 - `/health` → no auth
 
 ---
@@ -46,7 +49,6 @@ A small Node.js + TypeScript + Express API that sits between n8n, the DevSpot Co
 ## Prerequisites
 
 - **Node.js 20 LTS** (`node -v` should show `v20.x.x`)
-- A **Hootsuite API bearer token** with permission to read scheduled messages
 - A running **n8n instance** with a Flow 2 webhook configured at the URL you'll put in `N8N_FLOW_2_WEBHOOK_URL`
 - Docker (optional — for containerized deployment)
 
@@ -66,9 +68,8 @@ npm install
 cp .env.example .env
 
 # Edit .env — the only values you MUST change are:
-#   HOOTSUITE_API_TOKEN   → your real Hootsuite bearer token
 #   N8N_FLOW_2_WEBHOOK_URL → your n8n webhook URL
-# The generated secrets (N8N_SHARED_SECRET, DASHBOARD_PASSWORD) are already strong.
+# The generated secrets (N8N_SHARED_SECRET, SESSION_SECRET, DASHBOARD_PASSWORD) are already strong.
 
 # Start in development mode (hot reload)
 npm run dev
@@ -94,7 +95,7 @@ The server will log which port it's listening on. Hit `GET /health` to confirm i
 ### Group A — n8n-facing (header: `X-API-Secret: <your-secret>`)
 
 #### `POST /api/weekly-topics`
-n8n calls this every Monday to push the week's 5 topic suggestions. Clears the previous week's topics and inserts the new ones atomically.
+n8n calls this every Monday to push the week's 5 topic suggestions. Clears the previous week's topics and inserts the new ones atomically. Emits a `weekly_topics_replaced` event on the topics SSE stream.
 
 **Request:**
 ```json
@@ -118,21 +119,34 @@ n8n calls this every Monday to push the week's 5 topic suggestions. Clears the p
 
 ---
 
-#### `POST /api/drafts-ready`
-n8n calls this after Flow 2 finishes creating Hootsuite drafts. Updates the topic status to `drafts_ready` and starts tracking the post IDs for approval detection.
+#### `POST /api/drafts`
+n8n calls this after Flow 2 finishes generating content. Inserts the drafts into SQLite, updates the topic status to `drafts_ready`, and emits a `drafts_added` event on the drafts SSE stream.
 
 **Request:**
 ```json
 {
   "topic_id": 3,
-  "hootsuite_post_ids": ["hs_abc123", "hs_def456"],
-  "brand": "devspot"
+  "topic_title": "AI in Healthcare",
+  "drafts": [
+    {
+      "platform": "linkedin_devspot",
+      "brand": "devspot",
+      "content": "Draft content here..."
+    },
+    {
+      "platform": "x_sabeen",
+      "brand": "sabeen",
+      "content": "Draft content here..."
+    }
+  ]
 }
 ```
 
+`topic_id` is nullable — custom topics that Sabeen typed in have no `weekly_topics` row. `topic_title` is always required and is stored denormalized so drafts survive the Monday weekly_topics clear.
+
 **Response:**
 ```json
-{ "status": "ok", "tracked": 2 }
+{ "status": "ok", "inserted": 7 }
 ```
 
 ---
@@ -172,9 +186,48 @@ Manually add a topic to the published list (admin use).
 
 ---
 
-### Group B — Dashboard-facing (HTTP Basic Auth)
+### Group B — Dashboard-facing (session cookie)
 
-#### `GET /api/topics`
+#### Auth endpoints
+
+##### `POST /api/login`
+Validates credentials against the `DASHBOARD_USER` and `DASHBOARD_PASSWORD` env vars. On success, creates a server-side session and sets an httpOnly cookie in the browser. The cookie lasts 7 days.
+
+**Request:**
+```json
+{ "username": "sabeen", "password": "..." }
+```
+
+**Response:**
+```json
+{ "status": "ok", "username": "sabeen" }
+```
+
+---
+
+##### `POST /api/logout`
+Destroys the server-side session and clears the cookie.
+
+**Response:**
+```json
+{ "status": "ok" }
+```
+
+---
+
+##### `GET /api/me`
+Returns 200 if the session cookie is valid, 401 if not. The frontend calls this on page load to decide whether to show the dashboard or redirect to login.
+
+**Response (200):**
+```json
+{ "username": "sabeen" }
+```
+
+---
+
+#### Topic / pipeline endpoints
+
+##### `GET /api/topics`
 Returns the current week's topic cards.
 
 **Response:**
@@ -197,7 +250,7 @@ Returns the current week's topic cards.
 
 ---
 
-#### `GET /api/status`
+##### `GET /api/status`
 Returns the overall pipeline state derived from topic statuses.
 
 | Condition | `status` value |
@@ -214,15 +267,18 @@ Returns the overall pipeline state derived from topic statuses.
 
 ---
 
-#### `GET /api/calendar`
-Returns the cached Hootsuite scheduled-posts response. If the cache is older than 15 minutes (or doesn't exist), triggers a fresh Hootsuite fetch before responding.
+##### `GET /api/calendar`
+Stub endpoint. Returns an empty data set while the publishing integration decision is pending.
 
-**Response:** The raw Hootsuite `/v1/messages` response, as JSON.
+**Response:**
+```json
+{ "data": [], "note": "Calendar feature pending decision on publishing integration" }
+```
 
 ---
 
-#### `POST /api/generate`
-Triggers content generation. Marks the topic as `generating`, returns 202 immediately, then fires the n8n webhook in the background. If the n8n call fails, the topic status resets to `pending` so the user can retry.
+##### `POST /api/generate`
+Triggers content generation. Marks the topic as `generating`, returns 202 immediately, then fires the n8n webhook in the background. If the n8n call fails, the topic status resets to `pending` so Sabeen can retry. Emits a `topic_status_changed` event on the topics SSE stream.
 
 **Request (from a weekly topic):**
 ```json
@@ -245,6 +301,97 @@ Triggers content generation. Marks the topic as `generating`, returns 202 immedi
 ```json
 { "status": "generation_started", "topic_id": 3 }
 ```
+
+---
+
+#### Draft endpoints
+
+##### `GET /api/drafts`
+Returns a list of drafts. `original_content` is excluded from list responses to keep payloads light — fetch a single draft to get the full content.
+
+Sorted: `ready_to_publish` drafts appear first, then `draft`, both groups sorted by `updated_at DESC`.
+
+**Optional query params:**
+- `?status=draft` or `?status=ready_to_publish` — filter by status
+- `?topic_id=42` — filter by topic
+
+**Response:**
+```json
+{
+  "drafts": [
+    {
+      "id": 1,
+      "topic_id": 3,
+      "topic_title": "AI in Healthcare",
+      "platform": "linkedin_devspot",
+      "brand": "devspot",
+      "current_content": "...",
+      "status": "draft",
+      "created_at": "2026-04-20 09:00:00",
+      "updated_at": "2026-04-20 09:00:00"
+    }
+  ]
+}
+```
+
+---
+
+##### `GET /api/drafts/:id`
+Returns a single draft including `original_content` and `current_content`. Returns 404 if the draft does not exist.
+
+---
+
+##### `PATCH /api/drafts/:id`
+Updates `current_content` and bumps `updated_at`. Returns the full updated draft. Emits a `draft_updated` event on the drafts SSE stream.
+
+**Request:**
+```json
+{ "current_content": "Edited content here..." }
+```
+
+---
+
+##### `POST /api/drafts/:id/mark-ready`
+Promotes the draft to `ready_to_publish` and records the `topic_title` in `published_topics` for dedup. No-op if the draft is already `ready_to_publish`. Emits a `draft_status_changed` event on the drafts SSE stream.
+
+---
+
+##### `POST /api/drafts/:id/mark-draft`
+Demotes the draft back to `draft` status. Does NOT remove the entry from `published_topics`. Emits a `draft_status_changed` event on the drafts SSE stream.
+
+---
+
+##### `DELETE /api/drafts/:id`
+Hard-deletes the draft. Emits a `draft_deleted` event on the drafts SSE stream.
+
+**Response:**
+```json
+{ "status": "deleted", "id": 7 }
+```
+
+---
+
+#### SSE streams
+
+##### `GET /api/events/topics`
+A long-lived Server-Sent Events stream for the topics page. The browser opens this connection once and receives push events whenever topic state changes.
+
+| Event | Payload | When |
+|-------|---------|------|
+| `weekly_topics_replaced` | `{ count, week_start_date }` | n8n pushes new topics |
+| `topic_status_changed` | `{ topic_id, status }` | Generate is triggered or fails |
+
+---
+
+##### `GET /api/events/drafts`
+A long-lived Server-Sent Events stream for the drafts page.
+
+| Event | Payload | When |
+|-------|---------|------|
+| `drafts_added` | `{ topic_id, topic_title, count }` | n8n posts finished drafts |
+| `draft_updated` | Full draft object | PATCH is applied |
+| `draft_status_changed` | Full draft object | mark-ready or mark-draft |
+| `draft_deleted` | `{ id }` | DELETE is called |
 
 ---
 
@@ -274,7 +421,7 @@ Holds this week's 5 suggestions. Cleared and replaced every Monday when n8n push
 | `created_at` | TEXT | UTC datetime |
 
 ### `published_topics`
-The dedup list. A topic lands here when at least one of its Hootsuite posts gets approved by Sabeen.
+The dedup list. A topic lands here when Sabeen marks at least one of its drafts as ready to publish.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -284,42 +431,61 @@ The dedup list. A topic lands here when at least one of its Hootsuite posts gets
 | `published_at` | TEXT | UTC datetime |
 | `brand` | TEXT | `sabeen` / `devspot` / `polaris` / NULL |
 
-### `hootsuite_post_tracker`
-Links Hootsuite post IDs back to the topic that created them. The approval detection job reads this table every 15 minutes.
+### `drafts`
+Stores the content drafts produced by n8n. One row per platform per topic.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | INTEGER PK | Auto-increment |
-| `hootsuite_post_id` | TEXT UNIQUE | Hootsuite's own ID for the post |
-| `topic_id` | INTEGER | FK to weekly_topics.id |
-| `topic_title` | TEXT | Denormalized — survives weekly_topics being cleared |
+| `topic_id` | INTEGER | Nullable — custom topics have no `weekly_topics` row |
+| `topic_title` | TEXT | Denormalized — survives the Monday `weekly_topics` clear |
+| `platform` | TEXT | One of: `longform_mirror`, `linkedin_sabeen`, `linkedin_devspot`, `x_sabeen`, `x_devspot`, `x_polaris`, `substack` |
 | `brand` | TEXT | `sabeen` / `devspot` / `polaris` / NULL |
-| `last_known_status` | TEXT | `pending` → `approved` |
+| `original_content` | TEXT | What Claude produced. Written once, never changed. |
+| `current_content` | TEXT | What Sabeen edits. Starts as a copy of `original_content`. |
+| `status` | TEXT | `draft` → `ready_to_publish` |
 | `created_at` | TEXT | UTC datetime |
+| `updated_at` | TEXT | UTC datetime — updated on every edit |
 
-### `calendar_cache`
-Single-row table. Stores the latest full Hootsuite `/v1/messages` response as a JSON blob.
+### `sessions`
+Server-side session store for dashboard login. Managed automatically by the session middleware.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `id` | INTEGER PK | Always 1 (enforced by CHECK constraint) |
-| `data` | TEXT | Full Hootsuite response as JSON string |
-| `updated_at` | TEXT | When this row was last written |
+| `sid` | TEXT PK | Session ID (opaque string) |
+| `sess` | TEXT | JSON-encoded session data |
+| `expired` | TEXT | Expiry datetime — expired rows are pruned automatically |
 
 ---
 
-## The 15-minute job
+## Real-time updates (SSE)
 
-Every 15 minutes (and once on startup), the backend:
+Server-Sent Events (SSE) is a browser standard where the server pushes updates to the browser over a long-lived HTTP connection, without the browser having to poll.
 
-1. Reads all rows from `hootsuite_post_tracker` where `last_known_status != 'approved'`
-2. Calls `GET https://platform.hootsuite.com/v1/messages?state=SCHEDULED`
-3. Stores the full response in `calendar_cache`
-4. Finds any tracked post IDs that appear in the scheduled list — those are posts Sabeen approved
-5. Marks those tracker rows as `approved`
-6. For every topic that had at least one approved post: inserts it into `published_topics`
+**Why we use it:** The topics page needs to know immediately when n8n finishes pushing a new batch of topics. The drafts page needs to know when n8n finishes writing drafts, and when another browser tab edits or marks a draft ready. Polling would add unnecessary latency and server load.
 
-**Why poll instead of webhooks?** Hootsuite doesn't support outbound webhooks for post approval events on their standard plan. Polling every 15 minutes is the simplest reliable alternative.
+**Why two separate streams:** The topics page and the drafts page subscribe to different data. Keeping the streams separate means each page only receives events it cares about, and the connection stays lightweight. It also makes it easier to add stream-specific auth or filtering later.
+
+**What each stream emits:** See the `GET /api/events/topics` and `GET /api/events/drafts` endpoint descriptions in the API reference above.
+
+**Why cookies are needed for SSE:** The browser's `EventSource` API cannot set custom request headers, so the `X-API-Secret` pattern used for n8n routes does not work. Session cookies are sent automatically with every request including SSE connections, which is why dashboard-facing routes use cookie-based auth instead of a header.
+
+**Reconnect behavior:** `EventSource` reconnects automatically after a server restart or network hiccup. Any events emitted during the gap are lost — the browser does not receive a replay. This is acceptable for Phase 1; the dashboard will be slightly stale until the next event arrives, at which point it re-syncs.
+
+---
+
+## Auth
+
+Dashboard authentication uses server-side sessions backed by SQLite.
+
+- `POST /api/login` validates the submitted `username` and `password` against the `DASHBOARD_USER` and `DASHBOARD_PASSWORD` environment variables
+- On success, a session record is written to the `sessions` table and the browser receives an httpOnly cookie containing the session ID
+- The cookie is `httpOnly` (JavaScript cannot read it), `sameSite=lax`, and `secure=true` in production
+- Sessions expire after 7 days of inactivity
+- `GET /api/me` lets the frontend check on page load whether the current session is still valid — 200 means logged in, 401 means the session is gone or expired
+- Any protected endpoint that returns 401 should be treated by the frontend as a signal to redirect to the login page
+
+n8n-facing routes continue to use the `X-API-Secret` header, unchanged.
 
 ---
 
@@ -346,7 +512,7 @@ docker run -d \
 2. Clone the repo to `/opt/content-bot-backend`
 3. Copy `.env.example` to `.env` and fill in real values
 4. Run the Docker commands above
-5. Set up nginx as a reverse proxy pointing to port 3000 (also handles HTTPS via Let's Encrypt — required for Basic Auth to be secure)
+5. Set up nginx as a reverse proxy pointing to port 3000 (also handles HTTPS via Let's Encrypt — required for secure cookies in production)
 
 **Persistent data:** The SQLite file is at `/opt/content-bot/data/content-bot.db` on the host. Back this up before updates.
 
@@ -354,7 +520,7 @@ docker run -d \
 
 ## Manual testing guide
 
-Run these in order to verify a fresh deployment end-to-end.
+Run these in order to verify a fresh deployment end-to-end. The cookie jar file (`/tmp/cbot-cookies.txt`) persists the session across commands.
 
 ```bash
 # 1. Health check — no auth required
@@ -365,9 +531,21 @@ curl http://localhost:3000/health
 # ──────────────────────────────────────────────────────────────────────────────
 # Set up variables for the rest of the tests
 SECRET="8a3f1829b4240e2a02483aa2b6e62326aff35d02fa31fe62c53c2be89e490c98"
-BASIC="sabeen:rGmmj99qqWKUr3bn7ZIAj6A"
+COOKIES="/tmp/cbot-cookies.txt"
 
-# 2. Push weekly topics (as n8n would on Monday)
+# 2. Login — saves session cookie to file
+curl -s -c "$COOKIES" -X POST http://localhost:3000/api/login \
+  -H "Content-Type: application/json" \
+  -d '{ "username": "sabeen", "password": "rGmmj99qqWKUr3bn7ZIAj6A" }'
+
+# Expected: { "status": "ok", "username": "sabeen" }
+
+# 3. Check session is valid
+curl -s -b "$COOKIES" http://localhost:3000/api/me
+
+# Expected: { "username": "sabeen" }
+
+# 4. Push weekly topics (as n8n would on Monday)
 curl -s -X POST http://localhost:3000/api/weekly-topics \
   -H "Content-Type: application/json" \
   -H "X-API-Secret: $SECRET" \
@@ -409,66 +587,112 @@ curl -s -X POST http://localhost:3000/api/weekly-topics \
 
 # Expected: { "status": "ok", "inserted": 5 }
 
-# 3. Fetch topics as the dashboard would
-curl -s -u "$BASIC" http://localhost:3000/api/topics | python3 -m json.tool
+# 5. Fetch topics as the dashboard would
+curl -s -b "$COOKIES" http://localhost:3000/api/topics | python3 -m json.tool
 
 # Expected: { "topics": [ ...5 rows with status "pending"... ] }
 
-# 4. Check pipeline status
-curl -s -u "$BASIC" http://localhost:3000/api/status
+# 6. Check pipeline status
+curl -s -b "$COOKIES" http://localhost:3000/api/status
 
 # Expected: { "status": "idle", "topic_count": 5 }
 
-# 5. Trigger generation for topic 1
+# 7. Trigger generation for topic 1
 curl -s -X POST http://localhost:3000/api/generate \
   -H "Content-Type: application/json" \
-  -u "$BASIC" \
+  -b "$COOKIES" \
   -d '{ "topic_id": 1 }'
 
 # Expected: { "status": "generation_started", "topic_id": 1 }
 # (n8n call will fail if N8N_FLOW_2_WEBHOOK_URL isn't real — check server logs)
 
-# 5b. Check status again — should show "generating"
-curl -s -u "$BASIC" http://localhost:3000/api/status
-
-# 6. Simulate Flow 2 callback (as n8n would after creating Hootsuite drafts)
-curl -s -X POST http://localhost:3000/api/drafts-ready \
+# 8. Post drafts (as n8n would after Flow 2 finishes)
+curl -s -X POST http://localhost:3000/api/drafts \
   -H "Content-Type: application/json" \
   -H "X-API-Secret: $SECRET" \
   -d '{
     "topic_id": 1,
-    "hootsuite_post_ids": ["fake-hs-id-001", "fake-hs-id-002"],
-    "brand": "devspot"
+    "topic_title": "AI in Healthcare",
+    "drafts": [
+      { "platform": "linkedin_devspot", "brand": "devspot", "content": "LinkedIn DevSpot draft content..." },
+      { "platform": "linkedin_sabeen",  "brand": "sabeen",  "content": "LinkedIn Sabeen draft content..." },
+      { "platform": "x_devspot",        "brand": "devspot", "content": "X DevSpot draft content..." },
+      { "platform": "x_sabeen",         "brand": "sabeen",  "content": "X Sabeen draft content..." },
+      { "platform": "x_polaris",        "brand": "polaris", "content": "X Polaris draft content..." },
+      { "platform": "substack",         "brand": "sabeen",  "content": "Substack draft content..." },
+      { "platform": "longform_mirror",  "brand": "devspot", "content": "Longform mirror draft content..." }
+    ]
   }'
 
-# Expected: { "status": "ok", "tracked": 2 }
+# Expected: { "status": "ok", "inserted": 7 }
 
-# 7. Check status — topic 1 is now drafts_ready, others still pending
-curl -s -u "$BASIC" http://localhost:3000/api/status
+# 9. List all drafts
+curl -s -b "$COOKIES" http://localhost:3000/api/drafts | python3 -m json.tool
 
-# 8. Check the calendar cache (will trigger a Hootsuite fetch if cache is empty)
-curl -s -u "$BASIC" http://localhost:3000/api/calendar
+# Expected: { "drafts": [ ...7 rows... ] }
 
-# 9. Read the published topics list (as n8n would for dedup)
-curl -s -H "X-API-Secret: $SECRET" http://localhost:3000/api/published-topics
+# 9b. List drafts filtered by status
+curl -s -b "$COOKIES" "http://localhost:3000/api/drafts?status=draft"
 
-# 10. Manually add a published topic
-curl -s -X POST http://localhost:3000/api/published-topics \
+# 9c. List drafts for a specific topic
+curl -s -b "$COOKIES" "http://localhost:3000/api/drafts?topic_id=1"
+
+# 10. Fetch one draft (includes original_content)
+curl -s -b "$COOKIES" http://localhost:3000/api/drafts/1 | python3 -m json.tool
+
+# 11. Edit a draft
+curl -s -X PATCH http://localhost:3000/api/drafts/1 \
   -H "Content-Type: application/json" \
-  -H "X-API-Secret: $SECRET" \
-  -d '{ "title": "Old Topic We Already Covered", "brand": "devspot" }'
+  -b "$COOKIES" \
+  -d '{ "current_content": "Edited content that Sabeen improved..." }'
+
+# Expected: full updated draft object
+
+# 12. Mark as ready to publish
+curl -s -X POST http://localhost:3000/api/drafts/1/mark-ready \
+  -b "$COOKIES"
+
+# Expected: updated draft with status "ready_to_publish"
+
+# 13. Mark back as draft
+curl -s -X POST http://localhost:3000/api/drafts/1/mark-draft \
+  -b "$COOKIES"
+
+# Expected: updated draft with status "draft"
+
+# 14. Delete a draft
+curl -s -X DELETE http://localhost:3000/api/drafts/1 \
+  -b "$COOKIES"
+
+# Expected: { "status": "deleted", "id": 1 }
+
+# 15. Open SSE stream — Ctrl+C to stop
+curl -N -b "$COOKIES" http://localhost:3000/api/events/topics
+# In another terminal, push new topics or trigger generate to see events arrive
+
+curl -N -b "$COOKIES" http://localhost:3000/api/events/drafts
+# In another terminal, post drafts or edit one to see events arrive
+
+# 16. Logout
+curl -s -X POST http://localhost:3000/api/logout \
+  -b "$COOKIES" -c "$COOKIES"
 
 # Expected: { "status": "ok" }
 
-# 11. Verify the 401 guard on n8n routes
+# 17. Verify 401 after logout
+curl -s -b "$COOKIES" http://localhost:3000/api/topics
+
+# Expected: HTTP 401 — session is gone
+
+# 18. Verify n8n secret guard still works (no secret header)
 curl -s -X GET http://localhost:3000/api/published-topics
 
 # Expected: { "error": "Unauthorized" } with HTTP 401
 
-# 12. Verify Basic Auth guard on dashboard routes
-curl -s http://localhost:3000/api/topics
+# 18b. With the correct secret header
+curl -s -H "X-API-Secret: $SECRET" http://localhost:3000/api/published-topics
 
-# Expected: HTTP 401 with WWW-Authenticate header
+# Expected: { "topics": [ ... ] }
 ```
 
 ---
@@ -480,13 +704,18 @@ The `data/` directory doesn't exist or the process doesn't have write permission
 - Fix: `mkdir -p ./data && chmod 755 ./data`
 - In Docker: ensure the host directory exists before mounting: `mkdir -p /opt/content-bot/data`
 
-### Hootsuite returns 401
-Your `HOOTSUITE_API_TOKEN` is invalid or expired.
-- Fix: regenerate the token in Hootsuite Developer portal and update your `.env`
-- The approval job will log `Hootsuite fetch failed` every 15 minutes until fixed
+### SSE connection drops immediately
+The browser is not sending a valid session cookie. Make sure you are logged in via `POST /api/login` before opening the SSE stream. In curl, pass `-b "$COOKIES"` with the cookie jar file.
 
-### Hootsuite returns 403
-The token doesn't have permission to read messages. Ensure the OAuth scope includes `hs.messages.read`.
+### SSE not receiving events in production
+If you are running behind Nginx, check that response buffering is disabled for the SSE routes. Nginx buffers responses by default, which breaks streaming. Add these directives to the relevant Nginx location block:
+```
+proxy_buffering off;
+add_header X-Accel-Buffering no;
+```
+
+### EventSource reconnects on every server restart — events during restart are lost
+This is expected behavior for Phase 1. `EventSource` reconnects automatically, but events emitted while the connection was down are not replayed. The dashboard will be slightly stale until the next event arrives and re-syncs the UI. This is an acceptable tradeoff for the current phase.
 
 ### n8n webhook unreachable (ECONNREFUSED or ETIMEDOUT)
 The `N8N_FLOW_2_WEBHOOK_URL` is wrong or n8n is down.
@@ -497,8 +726,5 @@ The `N8N_FLOW_2_WEBHOOK_URL` is wrong or n8n is down.
 ### Topics show up as "pending" after clicking Generate
 Almost always means the n8n webhook call failed (see above). Check logs.
 
-### Calendar shows stale data
-The Hootsuite API call in the last polling cycle failed. Check logs for `Hootsuite fetch failed`. The cache will be updated on the next successful cycle.
-
 ### Server won't start — "Missing required environment variable"
-The log will tell you exactly which variable is missing. Copy `.env.example` to `.env` and fill in every value.
+The log will tell you exactly which variable is missing. Copy `.env.example` to `.env` and fill in every value. Make sure `SESSION_SECRET` is set — it is required for the session middleware to initialize.

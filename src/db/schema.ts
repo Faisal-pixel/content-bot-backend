@@ -4,11 +4,12 @@
  * Runs CREATE TABLE IF NOT EXISTS for every table on app startup.
  *
  * We're not using a migration framework (like Flyway or knex migrate) because
- * this is v1 and the schema is stable. If the schema needs to change in v2,
- * add an ALTER TABLE step here rather than pulling in a full migration library.
+ * the schema is intentionally simple. If the schema needs to change, add
+ * ALTER TABLE statements here rather than pulling in a full migration library.
  *
- * All four tables are created in a single db.exec call so they're applied
- * atomically — either all exist or none do.
+ * The DROP TABLE statements at the top are a one-time cleanup for tables that
+ * existed in Phase 0 but are no longer used. They're safe to run repeatedly —
+ * IF EXISTS means they do nothing on a fresh database.
  */
 
 import { db } from './connection';
@@ -16,6 +17,10 @@ import { logger } from '../utils/logger';
 
 export function initSchema(): void {
   db.exec(`
+    -- Phase 0 tables removed in Phase 1: clean them up on existing deployments.
+    DROP TABLE IF EXISTS hootsuite_post_tracker;
+    DROP TABLE IF EXISTS calendar_cache;
+
     CREATE TABLE IF NOT EXISTS weekly_topics (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
       week_start_date  TEXT NOT NULL,
@@ -35,22 +40,22 @@ export function initSchema(): void {
       brand        TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS hootsuite_post_tracker (
+    CREATE TABLE IF NOT EXISTS drafts (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
-      hootsuite_post_id TEXT NOT NULL UNIQUE,
-      topic_id          INTEGER NOT NULL,
+      topic_id          INTEGER,
       topic_title       TEXT NOT NULL,
+      platform          TEXT NOT NULL,
       brand             TEXT,
-      last_known_status TEXT NOT NULL DEFAULT 'pending',
-      created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+      original_content  TEXT NOT NULL,
+      current_content   TEXT NOT NULL,
+      status            TEXT NOT NULL DEFAULT 'draft',
+      created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    -- Single-row cache: id is always 1, enforced by the CHECK constraint
-    CREATE TABLE IF NOT EXISTS calendar_cache (
-      id         INTEGER PRIMARY KEY CHECK (id = 1),
-      data       TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+    CREATE INDEX IF NOT EXISTS idx_drafts_status     ON drafts(status);
+    CREATE INDEX IF NOT EXISTS idx_drafts_topic_id   ON drafts(topic_id);
+    CREATE INDEX IF NOT EXISTS idx_drafts_created_at ON drafts(created_at DESC);
   `);
 
   logger.info('Database schema initialized');
