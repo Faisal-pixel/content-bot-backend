@@ -66,7 +66,7 @@ app.use(
       httpOnly: true,
       sameSite: 'lax',
       // Only mark cookies as Secure in production — localhost doesn't use HTTPS
-      secure: config.nodeEnv === 'production',
+      secure: process.env.COOKIE_SECURE === 'true', // config.nodeEnv === 'production',
       maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
     },
   })
